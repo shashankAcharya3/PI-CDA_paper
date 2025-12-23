@@ -59,7 +59,8 @@ class SiameseEncoder(nn.Module):
         flat = f3.view(f3.size(0), -1) 
         z = self.fc(flat)
         
-        return z, f1, f2, f3 # Return intermediates for visualization
+        # return z, f1, f2, f3 # Return intermediates for visualization
+        return z # Return only the latent vector for actual use 
 
 # --- NEW: HEAD 1 (TASK CLASSIFIER) ---
 class TaskClassifier(nn.Module):
@@ -113,3 +114,50 @@ class PhysicsHead(nn.Module):
         baseline_est = out[:, 1].unsqueeze(1)
         
         return sensitivity_mag, baseline_est
+
+# --- 0. GRADIENT REVERSAL LAYER (Required for Head 2) ---
+from torch.autograd import Function
+
+class GradientReversalFn(Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+    @staticmethod
+    def backward(ctx, grad_output):
+        output = grad_output.neg() * ctx.alpha
+        return output, None
+
+class GRL(nn.Module):
+    def __init__(self, alpha=1.0):
+        super(GRL, self).__init__()
+        self.alpha = alpha
+    def forward(self, x):
+        return GradientReversalFn.apply(x, self.alpha)
+
+# --- NEW: HEAD 2 (DOMAIN DISCRIMINATOR) ---
+class DomainDiscriminator(nn.Module):
+    def __init__(self, latent_dim=64):
+        super(DomainDiscriminator, self).__init__()
+        
+        # 1. The Reversal Layer
+        # We put it inside the module so it's automatic.
+        self.grl = GRL(alpha=1.0)
+        
+        # 2. The Binary Classifier
+        # Input: 64-dim Latent Code
+        # Output: 1 Probability Score (0 = Source, 1 = Target)
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, 32),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(32, 1),
+            nn.Sigmoid() 
+        )
+
+    def forward(self, z):
+        # 1. Reverse Gradients
+        z_rev = self.grl(z)
+        
+        # 2. Predict Domain
+        return self.net(z_rev)
