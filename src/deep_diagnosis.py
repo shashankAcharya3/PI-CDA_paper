@@ -5,33 +5,37 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix
+from sklearn.manifold import TSNE
+from sklearn.metrics import confusion_matrix, accuracy_score
+import scipy.stats as stats
 import os
 import sys
 
-# Import your modules
+# Import architecture
 sys.path.append(os.path.abspath("."))
-from src.data_loader import GasDataset
 from src.models import SiameseEncoder, TaskClassifier, PhysicsHead
+from src.data_loader import GasDataset
 
-# CONFIG
+# Config
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CSV_PATH = "processed_data/gas_data_normalized.csv"
-if not os.path.exists(CSV_PATH): CSV_PATH = "gas_data_normalized.csv"
+CHECKPOINT_DIR = "checkpoints"
+PLOT_DIR = "diagnostic_plots"
 
-def load_source_model():
-    print("Loading Source Model (Batch 1)...")
-    path = "checkpoints/source_model.pth"
+if not os.path.exists(PLOT_DIR): os.makedirs(PLOT_DIR)
+
+def load_adapted_model(batch_id):
+    """Loads the specific model adapted for a given batch"""
+    fname = f"adapted_model_b{batch_id}.pth"
+    path = os.path.join(CHECKPOINT_DIR, fname)
+    
     if not os.path.exists(path):
-        print(f"❌ Error: {path} not found. Run Phase 1 training first.")
-        sys.exit()
-        
-    # Init Models
+        print(f"⚠️ Warning: {fname} not found. Skipping.")
+        return None, None, None
+
     enc = SiameseEncoder(128, 64).to(DEVICE)
     cls = TaskClassifier(64, 6).to(DEVICE)
     phy = PhysicsHead(64).to(DEVICE)
     
-    # Load Weights
     ckpt = torch.load(path, map_location=DEVICE)
     enc.load_state_dict(ckpt['enc'])
     cls.load_state_dict(ckpt['cls'])
@@ -40,72 +44,118 @@ def load_source_model():
     enc.eval(); cls.eval(); phy.eval()
     return enc, cls, phy
 
-def analyze_batch(enc, cls, batch_id, df):
-    print(f"\n--- ANALYZING BATCH {batch_id} ---")
-    ds = GasDataset(df, batch_id=batch_id)
-    if len(ds) == 0: return
-    loader = DataLoader(ds, batch_size=64, shuffle=False)
+def analyze_model_health():
+    print("--- STARTING COMPREHENSIVE DIAGNOSIS ---")
+    df = pd.read_csv("processed_data/gas_data_normalized.csv")
     
-    all_preds = []
-    all_labels = []
-    all_confs = []
+    report_data = []
     
-    with torch.no_grad():
-        for x, y, _ in loader:
-            x = x.to(DEVICE)
-            z = enc(x)
-            logits = cls(z)
-            probs = torch.softmax(logits, dim=1)
-            conf, pred = torch.max(probs, dim=1)
-            
-            all_preds.extend(pred.cpu().numpy())
-            all_labels.extend(y.numpy())
-            all_confs.extend(conf.cpu().numpy())
-            
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    all_confs = np.array(all_confs)
+    # We analyze specific interesting batches
+    # 2 (Early), 6 (The Shift), 8 (The Toxic One), 10 (The End)
+    target_batches = [2, 4, 6, 8, 9, 10]
     
-    # 1. Overall Accuracy
-    acc = (all_preds == all_labels).mean() * 100
-    print(f"  > Raw Accuracy: {acc:.2f}%")
-    
-    # 2. The "Lie Detector" (Confidence Analysis)
-    # We check accuracy at different confidence levels
-    high_conf_mask = all_confs > 0.8
-    if high_conf_mask.sum() > 0:
-        high_conf_acc = (all_preds[high_conf_mask] == all_labels[high_conf_mask]).mean() * 100
-        print(f"  > High Conf (>0.8) Samples: {high_conf_mask.sum()} / {len(all_labels)}")
-        print(f"  > Accuracy on High Conf: {high_conf_acc:.2f}%")
+    for b_id in target_batches:
+        print(f"\n🔍 Diagnosing Batch {b_id}...")
+        enc, cls, phy = load_adapted_model(b_id)
+        if enc is None: continue
         
-        if high_conf_acc < 50.0:
-            print("    ⚠️ CRITICAL: Model is Hallucinating! (Confident but Wrong)")
-    else:
-        print("  > No samples with confidence > 0.8")
-
-    # 3. Class Confusion (Which class disappears?)
-    unique, counts = np.unique(all_preds, return_counts=True)
-    print(f"  > Predicted Class Distribution: {dict(zip(unique, counts))}")
-    if len(unique) < 6:
-        print(f"    ⚠️ MODE COLLAPSE WARNING: Only {len(unique)}/6 classes predicted.")
-
-    return acc
-
-def main():
-    if not os.path.exists("plots"): os.makedirs("plots")
-    
-    df = pd.read_csv(CSV_PATH)
-    enc, cls, phy = load_source_model()
-    
-    accuracies = []
-    
-    for b_id in range(2, 11):
-        acc = analyze_batch(enc, cls, b_id, df)
-        accuracies.append(acc)
+        ds = GasDataset(df, batch_id=b_id)
+        loader = DataLoader(ds, batch_size=64, shuffle=False)
         
-    print("\n--- DIAGNOSIS SUMMARY ---")
-    print("If 'Raw Accuracy' > 'Your Training Accuracy', your training is hurting.")
-    print("If 'High Conf Accuracy' is low, your pseudo-labels are poisoning the model.")
+        all_z = []
+        all_preds = []
+        all_labels = []
+        all_confs = []
+        all_base = []
+        all_mags = []
+        all_concs = []
+        
+        with torch.no_grad():
+            for x, y, c in loader:
+                x = x.to(DEVICE)
+                z = enc(x)
+                
+                # Classifier
+                logits = cls(z)
+                probs = torch.softmax(logits, dim=1)
+                conf, pred = torch.max(probs, dim=1)
+                
+                # Physics
+                mag, base = phy(z)
+                
+                all_z.append(z.cpu().numpy())
+                all_preds.append(pred.cpu().numpy())
+                all_labels.append(y.numpy())
+                all_confs.append(conf.cpu().numpy())
+                all_base.append(base.cpu().numpy())
+                all_mags.append(mag.cpu().numpy())
+                all_concs.append(c.numpy())
+
+        # Concatenate
+        all_z = np.concatenate(all_z)
+        all_preds = np.concatenate(all_preds)
+        all_labels = np.concatenate(all_labels)
+        all_confs = np.concatenate(all_confs)
+        all_base = np.concatenate(all_base).flatten()
+        all_mags = np.concatenate(all_mags).flatten()
+        all_concs = np.concatenate(all_concs)
+
+        # --- ANALYSIS 1: ACCURACY & CONFIDENCE ---
+        acc = accuracy_score(all_labels, all_preds) * 100
+        avg_conf = np.mean(all_confs)
+        # Check "Confident Wrong" rate (Hallucination)
+        wrong_mask = all_preds != all_labels
+        conf_wrong = np.mean(all_confs[wrong_mask]) if wrong_mask.sum() > 0 else 0
+        
+        # --- ANALYSIS 2: PHYSICS HEALTH ---
+        # Correlation between Magnitude |z| and Log(Concentration)
+        # Should be high positive correlation
+        log_conc = np.log(all_concs + 1e-6)
+        r_physics, _ = stats.pearsonr(all_mags, log_conc)
+        
+        avg_baseline = np.mean(all_base)
+        
+        print(f"  > Accuracy: {acc:.2f}%")
+        print(f"  > Avg Confidence: {avg_conf:.3f} | Conf on Errors: {conf_wrong:.3f}")
+        print(f"  > Physics Correlation (Power Law): {r_physics:.3f} (Target > 0.8)")
+        print(f"  > Estimated Baseline: {avg_baseline:.4f}")
+
+        # --- PLOT 1: CONFUSION MATRIX ---
+        plt.figure(figsize=(6, 5))
+        cm = confusion_matrix(all_labels, all_preds, normalize='true')
+        sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues')
+        plt.title(f"Batch {b_id} Confusion Matrix (Acc {acc:.1f}%)")
+        plt.ylabel("True Class"); plt.xlabel("Predicted Class")
+        plt.savefig(f"{PLOT_DIR}/b{b_id}_confusion.png")
+        plt.close()
+        
+        # --- PLOT 2: T-SNE (Feature Space) ---
+        # Subsample for speed
+        if len(all_z) > 1000:
+            idx = np.random.choice(len(all_z), 1000, replace=False)
+            z_sub = all_z[idx]; y_sub = all_labels[idx]
+        else:
+            z_sub = all_z; y_sub = all_labels
+            
+        tsne = TSNE(n_components=2, random_state=42)
+        z_2d = tsne.fit_transform(z_sub)
+        
+        plt.figure(figsize=(8, 6))
+        sns.scatterplot(x=z_2d[:,0], y=z_2d[:,1], hue=y_sub, palette="tab10", legend='full')
+        plt.title(f"Batch {b_id} Feature Space (t-SNE)")
+        plt.savefig(f"{PLOT_DIR}/b{b_id}_tsne.png")
+        plt.close()
+        
+        report_data.append({
+            "Batch": b_id, "Accuracy": acc, 
+            "Physics_R": r_physics, "Baseline": avg_baseline,
+            "Conf_Correct": np.mean(all_confs[~wrong_mask]),
+            "Conf_Wrong": conf_wrong
+        })
+
+    # Save summary
+    pd.DataFrame(report_data).to_csv("diagnostic_report.csv", index=False)
+    print(f"\n✅ Diagnosis Complete. Check '{PLOT_DIR}' for images and 'diagnostic_report.csv'.")
 
 if __name__ == "__main__":
-    main()
+    analyze_model_health()

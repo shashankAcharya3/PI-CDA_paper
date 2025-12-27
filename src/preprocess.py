@@ -25,8 +25,6 @@ def strict_preprocessing(input_path="processed_data/gas_data_full.csv", output_p
     df = pd.read_csv(input_path)
     
     # 1. Identify Columns
-    # We scale ONLY the sensor features (feat_0 to feat_127).
-    # We do NOT scale Batch_ID, Class, or Concentration.
     feat_cols = [c for c in df.columns if 'feat_' in c]
     meta_cols = [c for c in df.columns if 'feat_' not in c]
     

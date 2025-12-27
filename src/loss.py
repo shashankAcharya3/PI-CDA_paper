@@ -14,8 +14,23 @@ class PICDA_Loss(nn.Module):
         self.ce = nn.CrossEntropyLoss()
         self.bce = nn.BCELoss()
         self.mse = nn.MSELoss()
+        self.class_weights = None  # For class-weighted loss
+
+    def set_class_weights(self, labels):
+        """Compute inverse frequency weights from label distribution"""
+        if isinstance(labels, torch.Tensor):
+            labels = labels.cpu()
+        unique, counts = torch.unique(torch.as_tensor(labels), return_counts=True)
+        weights = torch.zeros(6)  # 6 classes
+        for u, c in zip(unique, counts):
+            weights[u] = 1.0 / c.float()
+        weights = weights / weights.sum() * 6  # Normalize
+        self.class_weights = weights
 
     def task_loss(self, preds, targets):
+        if self.class_weights is not None:
+            weighted_ce = nn.CrossEntropyLoss(weight=self.class_weights.to(preds.device))
+            return weighted_ce(preds, targets)
         return self.ce(preds, targets)
 
     def entropy_loss(self, logits):
@@ -55,3 +70,50 @@ class PICDA_Loss(nn.Module):
     def adversarial_loss(self, preds, target_is_real):
         targets = torch.ones_like(preds) if target_is_real else torch.zeros_like(preds)
         return self.bce(preds, targets)
+    
+    # --- ADVANCED PHYSICS-INFORMED LOSSES ---
+    
+    def prototype_contrastive_loss(self, features, labels, prototypes, temperature=0.1):
+        """
+        Pull features toward their class prototype (centroid).
+        Prototypes are maintained as a memory bank.
+        """
+        features = F.normalize(features, dim=1)
+        prototypes = F.normalize(prototypes, dim=1)
+        
+        # Compute similarity to all prototypes
+        sim = torch.matmul(features, prototypes.T) / temperature  # [N, num_classes]
+        
+        # Cross entropy against true labels
+        return F.cross_entropy(sim, labels)
+    
+    def physics_consistency_loss(self, z_s, z_t, y_s, plabels, mask, physics_head):
+        """
+        Enforce physics consistency: samples of the same class should have
+        similar physics properties (baseline, sensitivity) across domains.
+        """
+        loss = torch.tensor(0.0, device=z_s.device)
+        count = 0
+        
+        for c in range(6):
+            src_idx = (y_s == c)
+            tgt_idx = mask & (plabels == c)
+            
+            if src_idx.sum() > 0 and tgt_idx.sum() > 0:
+                _, base_s = physics_head(z_s[src_idx])
+                _, base_t = physics_head(z_t[tgt_idx])
+                
+                # Same class should have similar baseline across domains
+                loss = loss + F.mse_loss(base_s.mean(), base_t.mean())
+                count += 1
+        
+        return loss / max(count, 1)
+    
+    def temporal_ensemble_loss(self, current_preds, ema_preds, temperature=0.5):
+        """
+        Consistency regularization between current model and EMA (temporal ensemble).
+        Encourages stable predictions over training.
+        """
+        current_probs = F.softmax(current_preds / temperature, dim=1)
+        ema_probs = F.softmax(ema_preds / temperature, dim=1)
+        return F.mse_loss(current_probs, ema_probs.detach())
