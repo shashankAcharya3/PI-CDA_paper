@@ -1,0 +1,12 @@
+
+Changelog history of the IEEE_lsens LaTeX class.
+ 2017/07/12
+ by Michael Shell (MDS)
+ http://www.michaelshell.org/
+
+
+*******
+
+  7/2017 v1.0 initial release, based on IEEEtran.cls v1.8b
+
+*******
